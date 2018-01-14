@@ -1,0 +1,367 @@
+---
+title: "R Final Project"
+author: "Prabhat Turlapati"
+date: "December 10, 2017"
+output: 
+  html_document:
+    toc: true
+    theme: paper
+    highlight: tango
+---
+
+
+## Introduction
+
+
+The Pittsburgh region is served by a combined sewer, which collects, conveys, and partially treats both stormwater and wastewater in the same infrastructure system. During periods of heavy rainfall, stormwater can exceed the capacity of combined sewers, which causes overflow into nearby rivers and streams. While these combined sewer overflows or CSO's mitigate upstream flooding, they release untreated wastewater into receiving water bodies. CSO's are regulated by state and federal authorities, thus cost effective strategies to manage CSO's are important for local municipalities. 
+
+We have been asked to conduct an analysis and answer the following questions:
+
+(Question 1) How much do residential property owners value - if at all - exterior open space?
+(Question 2) How much do residential property owners value - if at all - trees?
+(Question 3) What is the mean rebate per square foot of rain garden and per tree the municipality should offer property owners to incentivize their installation? See Section 3 for additional assumptions. 
+(Question 4) On the basis of rebate per overflow reduced, what five areas of the city (sewersheds) are the most cost effective at reducing combined sewer overflows? 
+
+
+
+```{r include=FALSE,echo=FALSE}
+require(ggplot2)
+require(tidyverse)
+require(forcats)
+require(polycor)
+require(corrplot)
+require(dplyr)
+require(MASS)
+require(ISLR)
+require(stringr)
+require(data.table)
+library(reshape)
+require(car)
+```
+
+
+### 1. Importing the Data
+
+We will import the data from the amazon web server. the data will be saved in sales.county, assessments.city, land.use.city, sewersheds. 
+
+```{r ,echo = FALSE,warning=FALSE}
+# Loading the data
+sales.county <- read.csv("https://s3.amazonaws.com/aws-website-programminginrforanalytics-tbal0/data/sales_county.csv", header = TRUE)
+assessments.city <- read.csv("https://s3.amazonaws.com/aws-website-programminginrforanalytics-tbal0/data/assessments_city.csv", header = TRUE)
+land.use.city <- read.csv("https://s3.amazonaws.com/aws-website-programminginrforanalytics-tbal0/data/land_use_city.csv", header = TRUE)
+sewersheds <- read.csv("https://s3.amazonaws.com/aws-website-programminginrforanalytics-tbal0/data/sewersheds.csv", header = TRUE)
+```
+
+
+### 2. Pre-join Cleaning
+
+In the data it has been noticed that some tables have duplicates. So the first step is to remove duplicates.
+
+```{r echo = FALSE,warning=FALSE}
+#Remove Duplicates
+sales.county<- as.data.frame(unique(sales.county))
+assessments.city<-as.data.frame(unique(assessments.city))
+land.use.city<-as.data.frame(unique(land.use.city))
+sewersheds<-as.data.frame(unique(sewersheds))
+
+```
+
+The second step is to consider only the lastest sale date for each PARID. This is done to maintain integrity of data. A sample of this is given below : 
+
+```{r echo = FALSE,warning=FALSE}
+# Sales Data, consider only the latest sale date for each ParID
+
+sales.county.latest <- as.data.table(sales.county)
+sales.county.latest[,latest.date.rank := rank(desc(SALEDATE)),by = "PARID"]
+sales.county.latest <- filter(sales.county.latest, latest.date.rank ==1.0)
+sales.county.latest <- dplyr::select(sales.county.latest,-latest.date.rank)
+sales.county.latest <- as.data.frame(sales.county.latest)
+
+# Sewersheds, consider only one sewer shed
+sewersheds.unique <- as.data.table(sewersheds)
+sewersheds.unique[,latest.sewer.shed.rank := rank(desc(sewershed)),by = "PARID"]
+sewersheds.unique <- filter(sewersheds.unique, latest.sewer.shed.rank ==1.0)
+sewersheds.unique <- dplyr::select(sewersheds.unique,-latest.sewer.shed.rank)
+sewersheds.unique <- as.data.frame(sewersheds.unique)
+
+
+
+```
+
+This parID has 8 different sale dates: 
+
+```{r echo = FALSE,warning=FALSE}
+filter(sales.county,PARID == "0096J00032000000") %>% arrange(desc(SALEDATE))
+
+```
+
+After cleaning up the table, we have retrieved only the latest row. AS given below:
+
+```{r echo = FALSE,warning=FALSE}
+filter(sales.county.latest,PARID == "0096J00032000000") %>% arrange(desc(SALEDATE))
+
+```
+
+The Land use data is not visually appealing, so the third step is to reshape the land.use.city data to decode LUnew sqft values to different columns in the same row as given below:
+
+```{r echo = FALSE,warning=FALSE}
+# Land Use Data Reshape
+land.use.city <- cast(land.use.city, PARID ~ LUnew)
+land.use.city[is.na(land.use.city)] <- 0
+
+
+```
+
+### 3. Joining the Data
+
+Once we perform the pre-join cleaning, we will merge the data and then subsequently perform the data cleaning operations on the data set we get here.
+
+```{r echo = FALSE,warning=FALSE}
+complete.assessments.data <- merge(x = assessments.city , y = sales.county.latest )
+complete.assessments.data <- merge(x = complete.assessments.data, y = land.use.city )
+complete.assessments.data <- merge(x = complete.assessments.data, y = sewersheds.unique)
+head(complete.assessments.data,3)
+```
+
+### Post-Join Data Cleaning
+
+This operation is performed based on the following assumptions:
+
+1) Residential parcels are the only ones required for regression so the included types of userdesc are VACANT LAND  ,OFFICE/APARTMENTS OVER    ,DAYCARE/PRIVATE SCHOOL  ,SINGLE FAMILY  ,TWO FAMILY  ,TOWNHOUSE  ,FOUR FAMILY  ,THREE FAMILY
+  ,ROWHOUSE  ,RETL/APT'S OVER  ,CONDOMINIUM  ,RES AUX BUILDING (NO HOUSE)  ,APART: 5-19 UNITS  ,OWNED BY METRO
+2) Only valid sales types are used. These categories are "VALID" and "OTHER VALID". This is referred from https://data.wprdc.org/dataset/real-estate-sales.
+3) The price of sales would be significant. So invalid sales values like $1 are removed.
+4) The price is heavily skewed towards the left, meaning there are many values that are low. To normalize we need to get rid of the outliers. This would give us an approximately normal data on the basis of price.
+
+
+```{r ,echo=FALSE,warning=FALSE}
+
+#Renaming column to lower case for ease 
+names(complete.assessments.data) <- tolower(names(complete.assessments.data))
+
+# Changing zipcode to factor
+complete.assessments.data$zip_code <- as.factor(complete.assessments.data$zip_code)
+
+
+# filter only residential parcels in the data.
+all.type.houses <- unique(complete.assessments.data$usedesc)
+res.type.houses <- c("SINGLE FAMILY","TWO FAMILY","TOWNHOUSE","FOUR FAMILY","DAYCARE/PRIVATE SCHOOL","THREE FAMILY","ROWHOUSE","RETL/APT'S OVER","CONDOMINIUM","RES AUX BUILDING (NO HOUSE)","APART: 5-19 UNITS")
+complete.assessments.data.resd <- filter(complete.assessments.data,usedesc %in% res.type.houses)
+
+# filter out invalid sales based on sales dictionary found at https://data.wprdc.org/dataset/real-estate-sales
+complete.assessments.data.resd.valid <- filter(complete.assessments.data.resd,saledesc %in% c("VALID SALE","OTHER VALID"))
+
+# filter outlier prices
+
+complete.assessments.data.resd.valid <- filter(complete.assessments.data.resd.valid,price>1)
+complete.assessments.data.resd.valid <- filter(complete.assessments.data.resd.valid,price<=395000)
+
+
+# House Condition Column added
+complete.assessments.data.resd.valid$houseconditiondesc <- 0
+complete.assessments.data.resd.valid$houseconditiondesc[complete.assessments.data.resd.valid$conditiondesc == "UNSOUND"] <- 0
+complete.assessments.data.resd.valid$houseconditiondesc[complete.assessments.data.resd.valid$conditiondesc == "VERY POOR"] <- 1
+complete.assessments.data.resd.valid$houseconditiondesc[complete.assessments.data.resd.valid$conditiondesc == "POOR"] <- 2
+complete.assessments.data.resd.valid$houseconditiondesc[complete.assessments.data.resd.valid$conditiondesc == "AVERAGE"] <- 3
+complete.assessments.data.resd.valid$houseconditiondesc[complete.assessments.data.resd.valid$conditiondesc == "FAIR"] <- 4
+complete.assessments.data.resd.valid$houseconditiondesc[complete.assessments.data.resd.valid$conditiondesc == "GOOD"] <- 5
+complete.assessments.data.resd.valid$houseconditiondesc[complete.assessments.data.resd.valid$conditiondesc == "VERY GOOD"] <- 6
+complete.assessments.data.resd.valid$houseconditiondesc[complete.assessments.data.resd.valid$conditiondesc == "EXCELLENT"] <- 7
+complete.assessments.data.resd.valid$houseconditiondesc <-as.factor(complete.assessments.data.resd.valid$houseconditiondesc)
+
+# Summarizing and visualizing the data
+summary(complete.assessments.data.resd.valid)
+```
+
+### Finding Price correlations
+
+To find the correlations between the individual variables in the data. Our first step is to take the continuous variables and plot them based on correlations.
+
+```{r echo=FALSE,warning=FALSE}
+# Removing unwanted columns for our analysis
+
+test.one <-dplyr::select(complete.assessments.data.resd.valid,price,bldgs,impervious,trees,open.space,finishedlivingarea,lotarea ,zip_code,houseconditiondesc,bedrooms,fullbaths,halfbaths,yearblt)
+corrplot.test.one<- hetcor(test.one)
+corrplot(corrplot.test.one$correlations)
+
+```
+
+
+### Plots
+
+To understand and visualize the data. I have included two plots and interpretations.
+
+
+#### 1. Plot for how prices vary with condition of houses
+
+
+```{r warning=FALSE,echo = FALSE}
+ggplot(complete.assessments.data.resd.valid,aes(x=conditiondesc,y=price)) + geom_boxplot() + xlab("CONDITION OF HOUSE") + ylab("PRICE") + ggtitle("Price v/s Condition of House")
+```
+
+**Interpretation**
+
+This boxplot graph shows us how the price is related to the condition of the house. We can observe that:
+1) The highest prices are observed when the house is in excellent condition. The lowest is observed when the house is in unsound condition.
+2) This can be helpful when determining the owner's predisposition towards pricing. If the house and plot are in excellent condition then the price is more and consequently the owner may value the land for open spaces and trees also more.
+
+#### 2. Plot for Total Area of the parcel with the tree space
+
+```{r echo = FALSE,warning=FALSE}
+ggplot(complete.assessments.data.resd.valid,aes(x=lotarea,y=open.space,color=usedesc,size=price)) + geom_point() + xlab("LOT AREA") + ylab("OPEN SPACE") + ggtitle("Open Spaces v/s Lot Area") + xlim(0,20000)
+
+```
+
+**Interpretation**
+
+This graph shows us how the lot area is related to the tree space. We can observe that:
+1) The lot area seems to be positively and linearly related to open spaces.
+2) Most of the houses which are in the data seem to belong to either single families or three family. This seems plausible as family houses would most likely value their yards or open spaces more, maybe due to presence of children.
+3) The size of prices also seems to be consistent. This is helpful in unders
+3) This can be helpful when determining the owner's predisposition towards pricing. If single families and three family houses would value their open spaces more then the compensation needs to be more.
+
+To test the data that we have in our plots, we go ahead with the regression.
+
+### Regression Analysis
+
+The regression includes the following :
+a.open.space : this is included as we require to find the coefficient of this value and how it relates to price.
+b.trees : this is required as we need to find the coefficient of this value and how it relates to price.
+c.zip_code : zipcodes may be a good predictor of price as upscale places would have higher prices
+d.conditiondesc : the condition of the parcel would be a good determinant of price.
+e.usedesc : the usage of the parcel may be a good indicator of the price.
+f.lotarea : this is a nice indicator of price.
+g.bedrooms : this indicates how price relates to bedrooms and maybe it will allow us to predict how open spaces are valued by different bedrooms.
+
+
+The following is my regression for this problem :
+
+model.one <- lm(log(price)~open.space+trees+zip_code+conditiondesc+usedesc+lotarea+bedrooms,complete.assessments.data.resd.valid)
+
+```{r include=FALSE,echo=FALSE}
+# The regression model
+model.one <- lm(log(price)~open.space+trees+zip_code+conditiondesc+usedesc+lotarea+bedrooms,complete.assessments.data.resd.valid)
+
+# To check for the correlation between the variables. Ideally all the values should be within 1 to 5 GVIF.
+vif(model.one)
+
+```
+
+
+#### The Residual V/s Fitted Graph
+
+```{r echo=FALSE,warning=FALSE}
+plot(model.one,which = 1)
+```
+
+**Interpretation**
+
+We have a model that is following the homoskedasticity principle, which means that there is no or very less variation in the residuals with the fitted values. This means that our model is linearly valid and we can use it for our analysis of sewersheds.
+
+#### The Normal Q-Q Plot
+
+```{r echo = FALSE,warning=FALSE}
+plot(model.one , which =2)
+```
+
+
+This plot is showing us that the data is normal and has very minimal skew. This is expected as the data is from the real-world and the outliers are bound to be there on both the extremeties. That is what we can see in this graph as well, but since it is approximately normal, our model is very accurately predicting price with the regressors.
+
+```{r echo=FALSE,warning=FALSE}
+
+model.one$coefficients
+open.space.coeff.effect<- (exp(model.one$coefficients[2]) - 1)*100
+tree.coeff.effect <- (exp(model.one$coefficients[3]) - 1)*100
+```
+
+### 4. Making Sense of the Data
+
+Once we have the model, we can estimate the effect of open spaces and trees on the price of the parcel and how much the owners actually value their open spaces or trees spaces. We will begin by answering the questions posed by the municipal corporation.
+
+#### a. Question 1
+
+According the model, residential owners on an average expect that an increase in one sqft of open space increases the price by around `r open.space.coeff.effect` percent of price, which is a significant change at 95%.
+
+#### b. Question 2
+
+According the model, residential owners on an average expect that an increase in one sqft of open space increases the price by around `r tree.coeff.effect` percent of price, which is a significant change at 95%.
+
+
+#### c. Question 3
+
+```{r echo=FALSE,warning=FALSE}
+# Adding column of value of open space of each parid
+
+complete.assessments.data.resd.valid$value.open.space <- complete.assessments.data.resd.valid$price*(open.space.coeff.effect/100)
+total.sum.price.open.space <- sum(complete.assessments.data.resd.valid$value.open.space)
+total.open.space <- sum(complete.assessments.data.resd.valid$open.space)
+
+
+mean.value.open.space.per.sqft <- total.sum.price.open.space/total.open.space
+
+total.no.of.trees <- round((total.open.space*4) / (pi*25*25))
+
+# Adding column of value of tree of each parid
+
+complete.assessments.data.resd.valid$value.trees <- complete.assessments.data.resd.valid$price*(tree.coeff.effect/100)
+complete.assessments.data.resd.valid$no.of.trees.parid <- ((complete.assessments.data.resd.valid$trees*4)/(pi*25*25))
+mean.value.per.tree <- (sum(complete.assessments.data.resd.valid$value.trees)/sum(complete.assessments.data.resd.valid$no.of.trees.parid))
+
+
+# Calculating rebates using the above calculation
+rebate.on.trees = mean.value.per.tree + 20
+rebate.on.raingardens = mean.value.open.space.per.sqft + 6
+```
+
+The mean price of open spaces is `r mean.value.open.space.per.sqft` and mean of price for trees is `r mean.value.per.tree`. According to the model, we should go ahead and provide rebate in case of planting trees and converting open spaces to rain gardens.
+
+The rebate provided for open spaces to convert into raingardens is `r rebate.on.raingardens`.
+The rebate provided for planting trees is `r rebate.on.trees`.
+
+
+#### d. Question 4
+
+
+```{r echo=FALSE, warning=FALSE}
+
+complete.assessments.data.resd.valid$trees.proposed.for.parcel<- complete.assessments.data.resd.valid$open.space*4/(pi*25*25)
+
+
+complete.assessments.data.resd.valid$rebate.proposed.for.parcel <-  complete.assessments.data.resd.valid$trees.proposed.for.parcel * rebate.on.trees
+
+
+complete.assessments.data.resd.valid$runoff.reduced.on.parcel <- complete.assessments.data.resd.valid$trees.proposed.for.parcel*1000
+  
+
+analysis.sewershed<-complete.assessments.data.resd.valid%>% group_by(sewershed)%>% summarise( total.rebate.on.sewershed= sum(rebate.proposed.for.parcel),
+total.runoff.reduced.on.sewershed=sum(runoff.reduced.on.parcel))
+
+# Calculating the mean CSO per Inflow
+
+cso.means.data<-sewersheds%>% group_by(sewershed)%>% summarise( csoperinfl.mean= mean(CSOperInfl))
+
+merged.data.cso.analysis<-merge(analysis.sewershed,cso.means.data)
+
+
+merged.data.cso.analysis$total.cso.reduced<- merged.data.cso.analysis$total.runoff.reduced.on.sewershed*merged.data.cso.analysis$csoperinfl.mean
+
+
+merged.data.cso.analysis$reduced.rebate.percso.final<-merged.data.cso.analysis$total.rebate.on.sewershed/merged.data.cso.analysis$total.cso.reduced
+
+
+merged.data.cso.analysis <- merged.data.cso.analysis %>% arrange(reduced.rebate.percso.final)
+
+head(merged.data.cso.analysis,n=5)
+
+```
+
+
+### Conclusion
+
+From our analysis we can conclude the following.
+
+1) We can conclude that M15, A6,M19,M29,M16 are the most cost effective sewersheds.
+2) The prices are positively correlated with open spaces, which means that the residents value their open spaces, and there needs to be compensation paid to the residents in order for us to initiate green measures.
+3) The prices are negatively correlated with tree spaces, which means that residents do not value tree spaces as much as they would the open spaces. This means that more needs to be done for the residents.
+
+Our analysis can be presented in its form to the municipal corporations with the above answers and our findings.
